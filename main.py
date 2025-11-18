@@ -1,12 +1,12 @@
 import os
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Literal
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from database import db, create_document, get_documents
+from database import db, create_document
 
 app = FastAPI(title="Telegram 2.0 API")
 
@@ -58,7 +58,7 @@ class ProfileUpdate(BaseModel):
     notifications_enabled: Optional[bool] = None
 
 class ChatCreate(BaseModel):
-    type: str = Field(..., pattern="^(personal|group|channel)$")
+    type: Literal["personal", "group", "channel"]
     title: str
     participants: List[str] = []
 
@@ -90,6 +90,10 @@ class AutomationExecuteIn(BaseModel):
     nodes: List[Dict[str, Any]]
     edges: List[Dict[str, Any]]
     payload: Dict[str, Any] = {}
+
+class StoryIn(BaseModel):
+    background: str = "#FAF9F7"
+    text: str = ""
 
 # ------------------------
 # Basic routes
@@ -162,34 +166,28 @@ def verify_otp(payload: OTPVerify):
     if not user:
         uid = create_document("user", {"phone": payload.phone, "name": "", "privacy_mode": False,
                                          "creator_mode": False, "notifications_enabled": True})
-        user = collection("user").find_one({"_id": collection("user").find_one({"_id": collection("user").find_one})})
-        user = collection("user").find_one({"phone": payload.phone})
-    token = user["_id"] if user else None
+        from bson import ObjectId
+        user = collection("user").find_one({"_id": ObjectId(uid)})
+    token = str(user["_id"]) if user else None
     collection("session").update_many({"phone": payload.phone}, {"$set": {"verified": True, "updated_at": now_utc()}})
-    return {"ok": True, "user_id": str(token)}
+    return {"ok": True, "user_id": token}
 
 @app.get("/api/users/me")
-def get_me(x_user_id: Optional[str] = None):
-    # fastapi won't map headers automatically with hyphen in signature; use dependency via request.headers is verbose
-    from fastapi import Request
-    def responder(request: Request):
-        user_id = request.headers.get("X-User-Id")
-        require_user(user_id)
-        u = collection("user").find_one({"_id": collection("user").database.client.get_default_database()["user"].find_one})
-        # Fallback by _id string
-        from bson import ObjectId
-        try:
-            u = collection("user").find_one({"_id": ObjectId(user_id)})
-        except Exception:
-            u = None
-        if not u:
-            raise HTTPException(status_code=404, detail="User not found")
-        u["_id"] = str(u["_id"])
-        return u
-    return responder
+async def get_me(request: Request):
+    user_id = request.headers.get("X-User-Id")
+    require_user(user_id)
+    from bson import ObjectId
+    try:
+        u = collection("user").find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        u = None
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    u["_id"] = str(u["_id"])
+    return u
 
 @app.put("/api/users/me")
-async def update_me(request):
+async def update_me(request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     body = await request.json()
@@ -205,7 +203,7 @@ async def update_me(request):
 # ------------------------
 
 @app.get("/api/chats")
-def list_chats(request):
+def list_chats(request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     chats = list(collection("chat").find({"participants": user_id}).sort("last_message_at", -1))
@@ -214,7 +212,7 @@ def list_chats(request):
     return chats
 
 @app.post("/api/chats")
-def create_chat(payload: ChatCreate, request):
+def create_chat(payload: ChatCreate, request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     participants = list(set(payload.participants + [user_id]))
@@ -234,8 +232,40 @@ def get_messages(chat_id: str, limit: int = 50):
         m["_id"] = str(m["_id"])
     return list(reversed(msgs))
 
+@app.get("/api/chats/{chat_id}/threads/{root_id}")
+def get_thread(chat_id: str, root_id: str, limit: int = 50):
+    from bson import ObjectId
+    # include root message and all with thread_root_id == root_id
+    q = {"chat_id": chat_id, "$or": [{"_id": ObjectId(root_id)}, {"thread_root_id": root_id}]}
+    msgs = list(collection("message").find(q).sort("created_at", 1).limit(limit))
+    for m in msgs:
+        m["_id"] = str(m["_id"])
+    return msgs
+
+@app.patch("/api/messages/{message_id}/reactions")
+async def patch_reaction(message_id: str, payload: Dict[str, Any], request: Request):
+    user_id = request.headers.get("X-User-Id")
+    require_user(user_id)
+    emoji = payload.get("emoji")
+    action = payload.get("action", "add")
+    from bson import ObjectId
+    msg = collection("message").find_one({"_id": ObjectId(message_id)})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    reactions = msg.get("reactions", {})
+    users = set(reactions.get(emoji, []))
+    if action == "add":
+        users.add(user_id)
+    else:
+        users.discard(user_id)
+    reactions[emoji] = list(users)
+    collection("message").update_one({"_id": ObjectId(message_id)}, {"$set": {"reactions": reactions, "updated_at": now_utc()}})
+    # broadcast reaction update
+    await await_broadcast(msg.get("chat_id", ""), {"type": "reaction", "message_id": message_id, "emoji": emoji, "users": list(users)})
+    return {"ok": True, "reactions": reactions}
+
 @app.post("/api/chats/{chat_id}/messages")
-def send_message(chat_id: str, payload: MessageCreate, request):
+async def send_message(chat_id: str, payload: MessageCreate, request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     mid = create_document("message", {
@@ -246,13 +276,20 @@ def send_message(chat_id: str, payload: MessageCreate, request):
         "thread_root_id": payload.thread_root_id,
         "reactions": {},
     })
-    collection("chat").update_one({"_id": {"$exists": True}, "_id": collection("chat").find_one}, {"$set": {"last_message_at": now_utc()}})
+    # update chat last_message_at if chat exists
+    from bson import ObjectId
+    try:
+        collection("chat").update_one({"_id": ObjectId(chat_id)}, {"$set": {"last_message_at": now_utc()}})
+    except Exception:
+        pass
     # Notify via websockets
-    await_broadcast(chat_id, {
+    await await_broadcast(chat_id, {
         "type": "message",
         "message_id": mid,
         "text": payload.text,
         "sender_id": user_id,
+        "attachments": payload.attachments,
+        "thread_root_id": payload.thread_root_id,
         "created_at": now_utc().isoformat()
     })
     return {"ok": True, "message_id": mid}
@@ -283,6 +320,8 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def await_broadcast(chat_id: str, message: Dict[str, Any]):
+    if not chat_id:
+        return
     await manager.broadcast(chat_id, message)
 
 @app.websocket("/ws/chats/{chat_id}")
@@ -308,7 +347,7 @@ def list_channels(tag: Optional[str] = None):
     return chans
 
 @app.post("/api/channels")
-def create_channel(payload: ChannelCreate, request):
+def create_channel(payload: ChannelCreate, request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     cid = create_document("channel", {
@@ -338,7 +377,7 @@ def list_posts(channel_id: str):
     return posts
 
 @app.post("/api/channels/{channel_id}/posts")
-def create_post(channel_id: str, payload: PostCreate, request):
+def create_post(channel_id: str, payload: PostCreate, request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     pid = create_document("post", {
@@ -351,11 +390,38 @@ def create_post(channel_id: str, payload: PostCreate, request):
     return {"ok": True, "post_id": pid}
 
 # ------------------------
+# Stories
+# ------------------------
+
+@app.get("/api/stories")
+async def list_my_stories(request: Request):
+    user_id = request.headers.get("X-User-Id")
+    require_user(user_id)
+    docs = list(collection("story").find({"author_id": user_id}).sort("created_at", -1))
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+@app.get("/api/stories/{user_id}")
+async def list_user_stories(user_id: str):
+    docs = list(collection("story").find({"author_id": user_id}).sort("created_at", -1))
+    for d in docs:
+        d["_id"] = str(d["_id"])
+    return docs
+
+@app.post("/api/stories")
+async def create_story(payload: StoryIn, request: Request):
+    user_id = request.headers.get("X-User-Id")
+    require_user(user_id)
+    sid = create_document("story", {"author_id": user_id, "background": payload.background, "text": payload.text})
+    return {"ok": True, "story_id": sid}
+
+# ------------------------
 # Analytics
 # ------------------------
 
 @app.post("/api/analytics/events")
-def analytics_event(payload: AnalyticsEventIn, request):
+def analytics_event(payload: AnalyticsEventIn, request: Request):
     user_id = request.headers.get("X-User-Id")
     create_document("analyticsevent", {
         "user_id": user_id or "anon",
@@ -369,7 +435,7 @@ def analytics_event(payload: AnalyticsEventIn, request):
 # ------------------------
 
 @app.get("/api/automation/flows")
-def list_flows(request):
+def list_flows(request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     flows = list(collection("automationflow").find({"owner_id": user_id}).sort("created_at", -1))
@@ -378,7 +444,7 @@ def list_flows(request):
     return flows
 
 @app.post("/api/automation/flows")
-def save_flow(payload: AutomationFlowIn, request):
+def save_flow(payload: AutomationFlowIn, request: Request):
     user_id = request.headers.get("X-User-Id")
     require_user(user_id)
     fid = create_document("automationflow", {
