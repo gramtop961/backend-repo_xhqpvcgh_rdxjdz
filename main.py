@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Any, Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from database import db, create_document
@@ -522,6 +523,37 @@ def miniapp_detail(app_id: str):
         if m["id"] == app_id:
             return m
     raise HTTPException(status_code=404, detail="Mini-app not found")
+
+# ------------------------
+# Export endpoints
+# ------------------------
+
+BACKEND_ARCHIVE_PATH = "logs/telegram2-backend.tar.gz"
+
+@app.get("/export/backend")
+def export_backend():
+    # Create archive if missing
+    try:
+        if not os.path.exists(BACKEND_ARCHIVE_PATH):
+            import tarfile
+            with tarfile.open(BACKEND_ARCHIVE_PATH, "w:gz") as tar:
+                include = [
+                    "main.py",
+                    "schemas.py",
+                    "database.py",
+                    "requirements.txt",
+                    "README.md",
+                    ".env",
+                    ".gitignore",
+                    "schema_examples.py",
+                    "start_server.sh",
+                ]
+                for path in include:
+                    if os.path.exists(path):
+                        tar.add(path)
+        return FileResponse(BACKEND_ARCHIVE_PATH, filename="telegram2-backend.tar.gz", media_type="application/gzip")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
